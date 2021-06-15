@@ -1,0 +1,748 @@
+---
+title: "Netlogo to R Pipeline: Resource Competition"
+author: "Shannon Carter"
+date: "March 11, 2019"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango 
+---
+
+# Goal
+
+The objective here is to make a clean reproducible pipeline to transform Netlogo output into a tidy rectangular dataframe. Here, I import behavior space data (i.e., experiment results) from Netlogo to R. The data I've imported here does several 'runs' (multiple treatments and replicates) of an simulation testing effects of phenology on consumer-resource interactions. There is summary data for each run (i.e., number of survivors, amount of time) and there's also time series info on size for each turtle/agent. Here, I process the data and make some diagnostic plots to finetune the model.
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = T, warning = F, message = F)
+
+## Set working directory and clear memory
+setwd("/Users/shannoncarter/Documents/phenology-abm")
+rm(list = ls(all = T))
+
+## Load required packages
+library(tidyverse)
+library(reshape2)
+library(RColorBrewer)
+library(lme4)
+library(wesanderson)
+library(ggsci)
+library(extrafont)
+library(cowplot)
+#extrafont::loadfonts(device = "win")
+
+## Load universal plotting elements
+mytheme <- theme_bw(base_size = 15, base_family = "Franklin Gothic Medium") +
+  theme(legend.text = element_text(size = 10),
+        legend.title = element_text(size = 11),
+        text = element_text(size = 14),     
+        axis.title = element_text(size = 12),
+        axis.text  = element_text(size = 10, family = "Consolas"),
+        panel.grid = element_blank())
+
+```
+
+# Load Final Data
+
+When revisiting the same behavior space multiple times, skip the data processing and just load the final tidy data. Every time I do a new behavior space in NetLogo, I'll run the processing steps below and these data frames will be updated.
+
+```{r load data, echo = F, include = F}
+
+# Processing to creat these dfs is done below, but can load these if working w same BS
+#ind_time <- read.csv("ind_time2sp.csv", header = T)
+ind <- read.csv("ind2sp.csv", header = T)
+run <- read.csv("run2sp.csv", header = T)
+trt <- read.csv("trt2sp.csv", header = T)
+params <- read.csv("params_2sp.csv", header = T)
+
+# Get factors in line
+#ind_time$asym_fish <- factor(ind_time$asym_fish, levels = c("none", "mild", "strong"))
+#ind_time$mean_fish <- factor(ind_time$mean_fish, levels = c("early", "same", "late"))
+#ind_time$sync_fish <- factor(ind_time$sync_fish, levels = c("low", "med", "high"))
+
+#ind$asym_fish <- factor(ind$asym_fish, levels = c("none", "mild", "strong"))
+#ind$mean_fish <- factor(ind$mean_fish, levels = c("early", "same", "late"))
+#ind$sync_fish <- factor(ind$sync_fish, levels = c("low", "med", "high"))
+
+#run$asym_fish <- factor(run$asym_fish, levels = c("none", "mild", "strong"))
+#run$mean_fish <- factor(run$mean_fish, levels = c("early", "same", "late"))
+#run$sync_fish <- factor(run$sync_fish, levels = c("low", "med", "high"))
+
+#trt$asym_fish <- factor(trt$asym_fish, levels = c("none", "mild", "strong"))
+#trt$mean_fish <- factor(trt$mean_fish, levels = c("early", "same", "late"))
+#trt$sync_fish <- factor(trt$sync_fish, levels = c("low", "med", "high"))
+
+```
+
+# Import Raw Data 
+
+First, be sure you export behavior space data from Netlogo in "table" format. When the raw data is exported as a spreadsheet, it comes in a really gnarly format. I haven't figured out a way for R to read it because it's not even close to rectangular, big header, mix of space delimited and bracket delimited, etc.. It's a mess. The table is still a bit messy, but much easier to wrangle.
+
+First, load the data. I've done a ton of different experiments in NetLogo, and not always certain each new one will be an improvement over the old or even work at all. So I keep most of the runs and number the files sequentially.
+
+```{r load table data}
+data <- read.table("sens2sp_g+.csv",
+                   header = T,  
+                   sep = ',',        # define the separator between columns
+                   skip = 6,         # 6 header rows we don't need
+                   quote = "\"",     # correct the column separator
+                   fill = T)         # add blank fields if rows have unequal length
+```
+
+# Inspect Data
+
+First, let's rename columns and drop some that we don't need. I keep some columns that are the same across all model runs because it will be useful to call them later, especially since different runs of the experiment might have differetn values. Some columns will always be the same, or are irrelevant. These I drop. 
+
+For this model, I had two turtle types (fishes and dflies), and varied the timing of hatching and densities of each. Outputs I collected from Netlogo were number of survivors of each turtle type and a vector of sizes for each individual turtle.
+
+```{r inspect}
+# select and rename columns. new_name = old name. 
+# renaming everything I keep, so can rename with select
+test <- data %>% 
+  select(run_num = X.run.number.,                  # each run number is an experimental unit
+         n_fish = n.fishes,                        # two types of "turtles" here: fish & dfly
+         n_dfly = n.dflies,                        # n_fish/dfly is the initial number
+         mean_fish = mean.hatch.fishes,            # mean hatching timing of fish
+         mean_dfly = mean.hatch.dflies,            # mean hatching timing of dflies
+         sync_fish = var.hatch.fishes,             # amount of variation in ind hatching timing
+         sync_dfly = var.hatch.dflies,             # standard deviation of normal distribution
+         asym_fish = asym.slope.fishes,            # size-dependent per capita effects 
+         asym_dfly = asym.slope.dflies,            # 0-1; 0 = all ind same, 1 = eat prop to body size
+         surv_fish = n.meta.fishes,                # number that 'metamorphed,' i.e., survived to next stage
+         surv_dfly = n.meta.dflies,                # size and time of metam based on dynamic growth rate
+         surv_tot  = n.meta.total,                 # surv_fish + surv_dfly
+         biom_fish = biom.fishes,                  # sum size of all metamorphed individuals
+         biom_dfly = biom.dflies,                  # sum size of all metamorphed individuals
+         biom_tot  = biom.total,                   # biom_fish + biom_dfly
+         meta_fish = X.meta.fish...of.fishes,      # vector of survival outcome for each individual
+         meta_dfly = X.meta.dfly...of.dflies,      # i.e., [0 0 1 1 0 1 1 ...] each # = 1 individual
+         sizes_fish = X.size.list.fish..of.fishes, # list of size for each ind for each time step
+         sizes_dfly = X.size.list.dfly..of.dflies) # i.e., [0 0 1 ... 9 9 9] [0 0 1 ... 6 7 7] [1 ind]
+          
+# Extract parameter values-- these are the 'treatments', inputs, and run-level results of the model for each run
+# I'll rejoin the output data with params later, after some summarizing/processing
+# Here, add qualitative levels for the treatment parameters. This will be different for each BS
+params <- test[,1:15]
+#params$sync_fish <- as.factor(params$sync_fish)
+params$mean_fish <- as.factor(params$mean_fish)
+#levels(params$sync_fish) <- c("high", "med", "low")
+#levels(params$mean_fish) <- c("early", "same", "late")
+
+#params$sync_dfly <- as.factor(params$sync_dfly)
+#params$mean_dfly <- as.factor(params$mean_dfly)
+#levels(params$sync_dfly) <- c("high", "med", "low")
+#levels(params$mean_dfly) <- c("early", "same", "late")
+#write.csv(params, "params_2sp.csv")
+
+```
+
+# Parse Individuals
+
+The 'sizes_x' columns have a time series of size for each individual. So in this case, each 'sizes_x' column contains 40 individuals x 250 time steps values. Individuals are contained in brackets, with space-delimited values representing the individual's size at that time step, i.e., [0 0 0 1 2 ... 9] [0 0 1 1 ... 5]. We ultimately want one row per individual per time step. So first, we need to separate by "]" to put individuals in columns, then gather individuals to rows. Then separate rows by " " to put time step in columns, then gather time to rows. All the while, doing fishes and dflies in parallel to maintain species identity.
+
+I treat the 'meta_x' columns in this step too. They're formatted similarly, except there's no time series- just one value per individual, i.e., [0 0 1 1 0 1 0 ...]. So I only have to separate and gather once.
+
+```{r parse individuals}
+# First, separate meta and sizes columns. Now each column only has data for one individual
+test <- test %>% 
+  separate(meta_fish,                               # separate meta_fish 
+          into = paste("m.f_", c(1:50), sep = ""),  # labels for new vars: mf_1, mf_2... m = meta, f = fish
+          sep = " ") %>%                            # every space marks a new ind
+  separate(meta_dfly,
+          into = paste("m.d_", c(1:50), sep = ""),
+          sep = " ") %>% 
+  separate(sizes_fish,                              # separate sizes_fish
+           into = paste("s.f_", c(1:50), sep = ""), # labels for new vars: sf_1, sf_2... s = size, f = fish
+           sep = "]") %>%                           # every ] marks a new ind
+  separate(sizes_dfly,                              
+           into = paste("s.d_", c(1:50), sep = ""),  
+           sep = "]")                               
+
+# This megapipe spreads and gathers across meta and size for both species
+# It's hard to follow all together- was built piece by piece to troubleshoot, and put together at the end
+test <- test %>%
+  select(run_num, m.f_1:m.f_50, m.d_1:m.d_50, s.f_1:s.f_50, s.d_1:s.d_50) %>% # keep run_num as unique id
+  gather(key, value, -run_num) %>%                                            # gather all but run_num
+  separate(key, into = c("var_sp", "id"), sep = "_") %>%  # 'var_sp' indicates 'variable' or 'species'
+  spread(var_sp, value) %>%                               # spread by 'var_sp' placeholder var
+  gather(key, value, -run_num, -id) %>% 
+  separate(key, into = c("var", "sp")) %>% 
+  spread(var, value) %>% 
+  arrange(run_num, as.numeric(id), sp)
+
+# Remove the brackets
+test$m <- gsub("[", "", test$m, fixed = T)
+test$s <- gsub("[", "", test$s, fixed = T)
+test$m <- gsub("]", "", test$m, fixed = T)
+test$s <- gsub("]", "", test$s, fixed = T)
+
+```
+
+# Parse Time Series
+
+Now, do the same separate and gather operations to parse the time vector and put in long format.
+
+```{r parse time}
+# Separate the size time series- each space represents a new time point
+ind_time <- test %>% 
+  separate(s, into = as.character(c(0:250)), sep = " ") %>% # it's easiest for each run to be the same length
+  select(-c(as.character(0))) %>%                           # I drop this because there's only a value for ind 1
+  group_by(run_num) %>% 
+  gather(as.character(1:250), key = "time", value = 'size') %>%
+  rename(meta = m) %>% 
+  arrange(run_num, sp, as.numeric(id))
+
+# Netlogo is bad at rounding, so have to do it here
+ind_time$size <- round(as.numeric(ind_time$size), 3)
+ind_time$time <- as.numeric(ind_time$time)
+
+# Rejoin with data associated with each run number (trt info, run-level response vars)
+ind_time <- left_join(ind_time, params, by = "run_num")
+ind_time <- ind_time %>%
+  select(run_num, sync_fish, sync_dfly, mean_fish, mean_dfly,  # trt info
+         surv_fish, surv_dfly, biom_fish, biom_dfly, biom_tot, # run-level output
+         time, sp, id, meta, size)                             # ind/time output
+
+#write.csv(ind_time, "ind_time2sp.csv")
+
+```
+
+# Summarize by Individual
+
+Now, I want to make some summarised datasets. First with one row per individual, then with one row per run number, and finally with one row per treatment. 
+
+```{r individual summary}
+# First, summarize by individual and add some individual level properies
+ind <- ind_time %>% 
+  group_by(run_num, sp, id, meta) %>%
+  summarise(max_size = max(size),                    # max/final size. size at metam or death
+            hatch_date = min(time[size > 0]),        # hatch date = when size jumps from 0
+            end_date = min(time[size == max(size)]), # end (meta or death) date is first day at max size
+            growth_time = end_date - hatch_date,     # lifespan
+            growth_rate = max(size)/growth_time)     # lifetime growth rate; size/lifespan
+
+# Rejoin with parameters and write csv
+ind <- left_join(ind, params, by = "run_num")
+ind <- ind %>%
+  select(run_num, sync_fish, sync_dfly, mean_fish, mean_dfly,  # trt info
+         surv_fish, surv_dfly, biom_fish, biom_dfly, biom_tot, # run-level output
+         sp, id, meta, hatch_date,       
+         end_date, growth_time, growth_rate, max_size)
+#write.csv(ind, "ind2sp.csv")
+
+```
+
+# Summarize by Treatment
+
+Now, I want to summarize to get means and error for each run and each treatment. 
+```{r treatment summary}
+# first, by run number
+ind$meta <- as.numeric(ind$meta)
+run <- ind %>% 
+  group_by(run_num, sp) %>%
+  filter(meta == 1) %>%                              # response variables only consider survivors
+  summarise(mean_biom = sum(max_size),               # check this and survival against raw output
+            se_biom   = "NA",                        # 1 biom value per run, so no error
+            mean_surv = sum(meta)/40,                   # check this an biom against raw output
+            se_surv   = "NA",                        # 1 surv value per run; just a placeholder
+            mean_mass = mean(max_size),              # should be biom/surv
+            se_mass   = sd(max_size)/sqrt(sum(meta)),# error
+            mean_emer = mean(end_date),              # emer is emergence date-- phenology of emergence
+            se_emer   = sd(end_date)/sqrt(sum(meta)),# error
+            mean_grow = mean(growth_rate),           # grow is individual time to development. size/time
+            se_grow   = sd(growth_rate)/sqrt(sum(meta))) %>% 
+  gather(mean_mass, se_mass, mean_emer, se_emer,     # gather all response variables
+         mean_grow, se_grow, 
+         mean_biom, se_biom, mean_surv, se_surv,
+         key = "variable", value = "abs_value") %>% 
+  separate(variable, into = c("prop", "var"), sep = "_") %>% # separate the name-- mean/se and variable
+  spread(prop, abs_value) %>%                               # spread so mean and se are separate columns
+  arrange(run_num, sp)
+
+# Rejoin with parameters & write csv
+run <- left_join(run, params, by = c("run_num"))
+run$mean <- round(as.numeric(run$mean), 2)
+run$se <- round(as.numeric(run$se), 2)
+run <- run %>% select(-c(surv_fish, surv_dfly, biom_fish, biom_dfly)) # these are redundant w calcs above
+#write.csv(run, "run2sp.csv")
+
+# Now by treatment
+trt <- run %>% 
+  group_by(sync_fish, mean_fish, sp, var) %>% 
+  summarise(mean_exp = mean(mean),            
+            se_exp   = sd(mean)/sqrt(6))      # 6 replicates
+
+# Rejoin with parameters & write csv
+trt <- left_join(trt, params, by = c("sync_fish", "mean_fish"))
+trt <- trt %>% 
+  select(-run_num, -c(14:19)) %>% 
+  unique(.) %>% 
+  rename(mean = mean_exp, se = se_exp) %>%
+  select(sync_fish, sync_dfly, mean_fish, mean_dfly, # put them in an intuitive order
+         asym_fish, asym_dfly, n_fish, n_dfly, 
+         sp, var, mean, se)
+
+trt$mean <- round(as.numeric(trt$mean), 2)
+trt$se <- round(as.numeric(trt$se), 2)
+#write.csv(trt, "trt2sp.csv")
+
+```
+
+# Plots
+
+Here are some diagnostic plots to get a quick look at the data. These will give an idea of what parameter space is reasonable and interesting to explore in future behavior space runs.
+
+
+```{r sensitivity analyses}
+
+abs <-  ggplot(data = subset(run, subset = (sp == "f")), aes(x = as.factor(sync_fish), y = mean, 
+                fill = mean_fish, color = mean_fish, group = mean_fish, shape = mean_fish)) + 
+  mytheme +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2)) +
+  geom_point(size = 1.5, alpha = 1/2,
+             position = position_dodge(width = 0.5)) +
+  facet_wrap(~var, ncol = 1, scales = "free_y") +
+  labs(y = "measurement", 
+       x = "phenological synchrony") + 
+  scale_color_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_fill_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_shape_manual(values = c(21, 24, 23))  +  
+  theme(legend.position = "none") +
+  scale_x_discrete(breaks = c("0", "15", "30"), labels = c("high", "med", "low"))
+#abs
+#ggsave("2sp_sens_baseline.tiff")
+
+sens <- ggplot(data = subset(run, subset = (sp == "f")), aes(x = as.factor(sync_fish), y = mean, 
+                fill = mean_fish, color = mean_fish, group = mean_fish, shape = mean_fish)) + 
+  mytheme +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2)) +
+  geom_point(size = 1.5, alpha = 1/2,
+             position = position_dodge(width = 0.5)) +
+  facet_wrap(~var, ncol = 1, scales = "free_y") +
+  labs(y = NULL, 
+       x = "phenological synchrony") + 
+  scale_color_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_fill_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_shape_manual(values = c(21, 24, 23))  + 
+  theme(legend.position = "none") +
+  scale_x_discrete(breaks = c("0", "15", "30"), labels = c("high", "med", "low"))
+sens
+ggsave("2sp_sens_perturb.tiff")
+
+
+```
+
+
+Dabestr plot
+
+```{r}
+
+## write out response variable names for facet wrap
+variable_names_abs <- list(
+  'surv' = "proportion survival",
+  'biom' = "biomass export (a.u.)",
+  'mass' = "per capita mass (a.u.)",
+  'grow' = "per capita growth (mass/life span)", 
+  'emer' = "advancement date (doy)"
+)
+
+variable_labeller_abs <- function(variable, value){
+  return(variable_names_abs[value])
+}
+
+## write out response variable names for facet wrap
+variable_names_rel <- list(
+  'surv' = "survival (%Δ high sync)",
+  'biom' = "biomass export (%Δ high sync)",
+  'mass' = "per capita mass (%Δ high sync)",
+  'grow' = "per capita growth (%Δ high sync)", 
+  'emer' = "advancement date (%Δ high sync)"
+)
+
+variable_labeller_rel <- function(variable, value){
+  return(variable_names_rel[value])
+}
+
+
+## write out response variable names for facet wrap
+baseline_means <- subset(trt, subset = (sync_fish == 0))
+baseline_means <- baseline_means %>%
+  subset(sp == "f") %>% 
+  select(c("sync_fish", "mean_fish", "var", "mean")) 
+baseline_means <- baseline_means[,3:5]
+colnames(baseline_means)[3] <- "baseline_mean"
+
+# now, add in baseline averages (conditions at med sync and symmetic comp) to run data
+trt_dabest <- trt %>% 
+  subset(sp == "f") %>% 
+  select(c("sync_fish", "mean_fish", "var", "mean", "se"))
+trt_dabest <- left_join(trt_dabest, baseline_means, by = c("var", "mean_fish"))
+   
+meandiffs_trt <- trt_dabest %>% 
+  mutate(umd = (mean - baseline_mean)/baseline_mean,
+         umd_se = (se/baseline_mean))
+#meandiffs_trt <- subset(meandiffs_trt, subset = (sync_fish != 0))
+#meandiffs_trt$sync_fish <- factor(meandiffs_trt$sync_fish, levels = c("med", "high"))
+
+meandiffs_trt$var <- factor(meandiffs_trt$var, levels = c("surv", "biom", "mass", "grow", "emer"))
+run$var <- factor(run$var, levels = c("surv", "biom", "mass", "grow", "emer"))
+run1 <- subset(run, subset = (mean_fish != 50 & mean_fish != 70))
+
+## first, the raw data
+rawdata <- ggplot(data = subset(run, subset = (sp == "f")), aes(x = as.factor(sync_fish), y = mean, 
+                fill = mean_fish, color = mean_fish, group = mean_fish, shape = mean_fish)) + 
+  mytheme +
+  #geom_smooth(method = "lm", formula = y ~ poly(x, 2)) +
+  geom_point(size = 1.5, alpha = 0.5,
+             position = position_dodge(width = 0.5)) +
+  facet_wrap(~var, ncol = 1, scales = "free_y", labeller = variable_labeller_abs) +
+  labs(y = "absolute measurement", 
+       x = "phenological synchrony", y = NULL) + 
+  scale_color_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_fill_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_shape_manual(values = c(21, 24, 23))  + 
+  theme(legend.position = "none", panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_text(margin = margin(t = 0, r = 30, b = 0, l = 0))) +
+  scale_x_discrete(breaks = c("0", "15", "30"), labels = c("high", "med", "low"))
+rawdata
+
+## Now, making the mean_diffs df
+mean_diffs <- ggplot(meandiffs_trt,
+                     aes(x = as.factor(sync_fish), y = umd, 
+                          color = mean_fish, shape = mean_fish, fill = mean_fish, group = mean_fish)) + mytheme +
+  geom_smooth(span = 5) +
+  geom_errorbar(aes(ymax = umd + umd_se, ymin = umd - umd_se), width = 0,
+                position = position_dodge(width = 0.5), size = 1) +
+  geom_point(size = 2.5, color = "black",
+             position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_fill_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_shape_manual(values = c(21, 24, 23))  + 
+  facet_wrap(~var, ncol = 1, scales = "free_y", labeller = variable_labeller_rel) +
+  theme(legend.position = "none",
+        axis.title.y = element_text(margin = margin(t = 0, r = 30, b = 0, l = 0))) +
+  labs(x = "phenological synchrony",
+       y = "proportional difference from corresponding asymmetry at high synchrony", 
+       color = "relative mean arrival\nof focal species",
+       shape = "relative mean arrival\nof focal species",
+       fill = "relative mean arrival\nof focal species") +
+  scale_x_discrete(breaks = c("0", "15" ,"30"), labels = c("high", "med", "low"))
+mean_diffs
+
+fig4 <- plot_grid(rawdata, mean_diffs, ncol = 2)
+fig4
+tiff("fig4.tiff", height = 7500, width = 5200, units = "px", res = 800, compression = "lzw")
+plot(fig4)
+dev.off()
+```
+
+
+```{r, echo = F}
+
+ggplot(ind, aes(x = hatch_date, color = sp, fill = sp)) + mytheme +
+  geom_density(alpha = 0.5, size = 1.2) +
+  facet_grid(sync_fish ~ mean_fish) +
+  scale_color_manual(values = c("#F28335", "#489C92")) +
+  scale_fill_manual(values = c("#F28335", "#489C92")) +
+  labs(title = "Hatching timing treatments",
+       x = "hatching date",
+       y = "density of individuals") 
+```
+
+Presentation figure versions
+
+```{r}
+
+## Presentation theme - larger fonts
+pres_theme <- theme_bw(base_size = 17, base_family = "Franklin Gothic Medium") +
+  theme(legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14),
+        text = element_text(size = 16),     
+        axis.title = element_text(size = 14),
+        axis.text  = element_text(size = 12, family = "Consolas"),
+        panel.grid = element_blank())
+
+## Now, making the mean_diffs df
+meandiffs_pres <- ggplot(subset(meandiffs_trt, subset = (var != "emer")),
+                     aes(x = as.factor(sync_fish), y = umd, 
+                          color = mean_fish, shape = mean_fish, fill = mean_fish, group = mean_fish)) + pres_theme +
+  geom_smooth(span = 5) +
+  geom_errorbar(aes(ymax = umd + umd_se, ymin = umd - umd_se), width = 0,
+                position = position_dodge(width = 0.5), size = 1) +
+  geom_point(size = 4, color = "black",
+             position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_fill_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_shape_manual(values = c(21, 24, 23))  + 
+  facet_wrap(~var, ncol = 2, scales = "free_y", labeller = variable_labeller_rel) +
+  #theme(legend.position = "none") +
+        #axis.title.y = element_text(margin = margin(t = 0, r = 30, b = 0, l = 0))) +
+  labs(x = "phenological synchrony",
+       y = "proportional difference from corresponding\nasymmetry at high synchrony", 
+       color = "relative mean arrival\nof focal species",
+       shape = "relative mean arrival\nof focal species",
+       fill = "relative mean arrival\nof focal species") +
+  scale_x_discrete(breaks = c("0", "15" ,"30"), labels = c("high", "med", "low"))
+meandiffs_pres
+ggsave("mean_diffs.tiff")
+```
+
+
+```{r, echo = F}
+
+ind_fewsync <- subset(ind, subset = sync_fish == c(3, 15, 27))
+ind_fewsync$sync_fish1 <- as.character(ind_fewsync$sync_fish)
+ind_fewsync$sync_fish1 <- fct_recode(ind_fewsync$sync_fish1, "high synchrony (σ = 3)" = "3", "medium synchrony (σ = 15)" = "15", "low synchrony (σ = 27)" = "27")
+
+ind_fewsync$sync_fish1 <- factor(ind_fewsync$sync_fish1, levels = c("high synchrony (σ = 3)", "medium synchrony (σ = 15)", "low synchrony (σ = 27)"))
+
+ind_fewsync$mean_fish1 <- as.character((ind_fewsync$mean_fish))
+ind_fewsync$mean_fish1 <- fct_recode(ind_fewsync$mean_fish1, "focal species first" = "45", "same mean timing" = "60", "focal species second" = "75")
+
+ind_fewsync$species <- as.character(ind_fewsync$sp)
+ind_fewsync$species <- fct_recode(ind_fewsync$species, "secondary" = "d", "focal" = "f")
+ind_fewsync$species <- factor(ind_fewsync$species, levels = c("focal", "secondary"))
+ind_fewsync <- subset(ind_fewsync, subset = (meta == 1 | meta == 0))
+
+#ggplot(subset(ind, subset = (meta ==1)),
+ggplot(ind, aes(x = hatch_date, y = max_size, color = sp)) + mytheme +
+  geom_point(size = 1, alpha = 0.2, position = 'jitter') +
+  stat_smooth(se = F) +
+  facet_grid(sync_fish ~ mean_fish) + 
+  scale_color_manual(values = c("#F28335", "#489C92")) +
+  scale_x_continuous(limits = c(0, 140), breaks = seq(0, 120, by = 30)) +
+  labs(title = "Final size by hatching date",
+       x = "hatching date",
+       y = "final size")
+
+fig6 <- ggplot(subset(ind_fewsync, subset = (meta == 1)),
+       aes(x = hatch_date, y = growth_rate, color = species)) +
+  geom_jitter(alpha = 0.7, position = 'jitter') +
+  geom_boxplot(data = subset(ind_fewsync, subset = (meta ==1)), 
+               mapping = aes(y = growth_rate, x = 150, color = species, fill = species),
+               width = 30, alpha = 0.5, size = 1.2) +
+  #stat_smooth(se = F) +
+  facet_grid(mean_fish1 ~ sync_fish1) + 
+  scale_x_continuous(limits = c(0, 165), breaks = seq(0, 120, by = 30)) +
+  geom_vline(aes(xintercept = 120), linetype = "dashed") +
+  scale_y_continuous(limits = c(0, 0.3), breaks = seq(0, 0.3, by = 0.05)) +
+  scale_size_manual(values = c(0.7, 2.5)) +
+  labs(x = "arrival date",
+       y = "growth rate (final size / lifespan)") +
+  theme(panel.grid.major = element_line(color = 'gray')) + 
+  scale_color_manual(values = c("#5DBCD2", "#FFB986")) + 
+  scale_fill_manual(values = c("#5DBCD2", "#FFB986")) + 
+ mytheme
+fig6
+ggsave("fig6.tiff")
+```
+
+```{r, echo = F}
+
+ggplot(subset(ind, subset = (meta == 1)), 
+       aes(x = hatch_date, y = growth_time, color = sp)) + mytheme +
+  geom_point(alpha = 0.2, size = 1) +
+  stat_smooth(method = "lm", formula = y ~ poly(x, 2), se = T, size = 1) +
+  facet_grid(sync_fish ~ mean_fish, scales = "free") + 
+  scale_color_manual(values = c("#F28335", "#489C92")) + 
+  labs(title = "Growth rate by hatching date",
+       x = "hatching date",
+       y = "days to metamorphosis")
+
+```
+
+```{r, echo = F}
+# Looks like in several cases, there are some individuals hatching on the last day, way later than the others. Check.
+ggplot(ind, aes(x = hatch_date, y = meta, color = sp)) + mytheme +
+  geom_point(alpha = 0.25) + 
+  stat_smooth(method = 'glm', method.args = 'binomial', se = F, size = 1.5) +
+  facet_grid(sync_fish ~ mean_fish) + 
+  xlab("hatch date") + ylab("probability of survival") +
+  scale_color_manual(values = c("#F28335", "#489C92")) +
+  scale_x_continuous(limits = c(0, 140), breaks = seq(0, 120, by = 30)) +
+  labs(title = "Survival probability by hatching date",
+       x = "hatching date",
+       y = "probability of survival")
+```
+
+```{r, echo = F}
+
+variable_names <- list(
+  'biom' = "biomass export", 
+  'emer' = "emergence date",
+  'grow' = "per capita growth rate",
+  'mass' = "per capita mass",
+  'surv' = "survival"
+  )
+
+variable_labeller <- function(variable, value){
+  return(variable_names[value])
+}
+
+ggplot(subset(trt, subset = (sp == "f")),
+       aes(x = sync_fish, y = mean, fill = mean_fish, color = mean_fish, group = mean_fish, shape = mean_fish)) + mytheme +
+  geom_point(size = 3, color = 'black') + 
+  geom_errorbar(aes(max = mean + se, min = mean - se), width = 0) +
+  geom_line() +
+  facet_wrap(~ var, scales = "free", labeller = variable_labeller) +
+  theme(legend.position = c(0.75, 0.22)) +
+  scale_fill_manual(values = wes_palette(n = 3, name = "GrandBudapest1")) +
+  scale_color_manual(values = wes_palette(n = 3, name = "GrandBudapest1")) +
+  labs(title = "Responses of vital rates to phenology manipulations",
+       x = "phenological synchrony",
+       y = "mean +/- se",
+       fill = "mean arrival",
+       color = "mean arrival", 
+       shape = "mean arrival") +
+  scale_shape_manual(values = c(21, 24, 23))
+
+```
+
+```{r, echo = F}
+
+ggplot(subset(ind, subset = (sp == "f")), 
+                aes(x = hatch_date, y = meta, color = sync_fish)) + mytheme +
+  geom_point(alpha = 0.25) + 
+  stat_smooth(method = 'glm', method.args = 'binomial', size = 1.5, alpha = 0.5, se = F) +
+  facet_wrap(~ mean_fish) +
+  scale_color_manual(values = wes_palette(n = 3, name = "GrandBudapest1")) +
+  scale_x_continuous(limits = c(0, 140), breaks = seq(0, 120, by = 30)) +
+  labs(title = "Probability of fish survival by hatching date",
+       x = "hatching date",
+       y = "probability of survival")
+```
+
+```{r, echo = F}
+
+## Subset to include only individuals that metamorphed
+ind_surv <- subset(ind, subset = (meta == 1 & sp == "f"))
+
+## Original hatching and metamorph
+ggplot(ind_surv, aes(end_date)) + mytheme +
+  # gray: original/imposed hatching synchrony
+  geom_density(size = 1, alpha = 0.25, fill = "#F28335", color = "#F28335") + 
+  # blue: metamorphosis dates of survivors, scaled to day 0
+  #geom_density(data = ind_surv, size = 1, alpha = 0.5, color = "steelblue4", fill = "steelblue4",
+  #             aes(x = end_date)) +
+  facet_grid(sync_fish ~ mean_fish) + 
+  theme(strip.text.x = element_text(size = 14),
+        strip.text.y = element_text(size = 14)) +
+  scale_x_continuous(limits = c(60, 250), breaks = seq(60, 250, by = 60)) +
+  labs(title = "Phenology across ontogeny",
+       x = "date",
+       y = "density of individuals")
+
+```
+
+```{r presentation figures}
+# ggtheme with larger fonts suitable for presentations
+pres_theme <- theme_bw(base_size = 15, base_family = "Franklin Gothic Medium") +
+  theme(legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14),
+        text = element_text(size = 14),     
+        axis.title = element_text(size = 14),
+        axis.text  = element_text(size = 12, family = "Consolas"),
+        #axis.text.x = element_blank(),
+        #axis.ticks.x = element_blank(),
+        panel.grid = element_blank(), 
+        strip.text = element_text(size = 14))
+
+## write out response variable names for facet wrap
+variable_names_abs <- list(
+  'surv' = "proportion survival",
+  'biom' = "biomass export (a.u.)",
+  'mass' = "per capita mass (a.u.)",
+  'grow' = "per capita growth (mass/life span)", 
+  'emer' = "advancement date (doy)"
+)
+
+variable_labeller_abs <- function(variable, value){
+  return(variable_names_abs[value])
+}
+
+## write out response variable names for facet wrap
+variable_names_rel <- list(
+  'surv' = "survival (%Δ high sync)",
+  'biom' = "biomass export (%Δ high sync)",
+  'mass' = "per capita mass (%Δ high sync)",
+  'grow' = "per capita growth (%Δ high sync)", 
+  'emer' = "advancement date (%Δ high sync)"
+)
+
+variable_labeller_rel <- function(variable, value){
+  return(variable_names_rel[value])
+}
+
+
+## write out response variable names for facet wrap
+baseline_means <- subset(trt, subset = (sync_fish == 0))
+baseline_means <- baseline_means %>%
+  subset(sp == "f") %>% 
+  select(c("sync_fish", "mean_fish", "var", "mean")) 
+baseline_means <- baseline_means[,3:5]
+colnames(baseline_means)[3] <- "baseline_mean"
+
+# now, add in baseline averages (conditions at med sync and symmetic comp) to run data
+trt_dabest <- trt %>% 
+  subset(sp == "f") %>% 
+  select(c("sync_fish", "mean_fish", "var", "mean", "se"))
+trt_dabest <- left_join(trt_dabest, baseline_means, by = c("var", "mean_fish"))
+   
+meandiffs_trt <- trt_dabest %>% 
+  mutate(umd = (mean - baseline_mean)/baseline_mean,
+         umd_se = (se/baseline_mean))
+#meandiffs_trt <- subset(meandiffs_trt, subset = (sync_fish != 0))
+#meandiffs_trt$sync_fish <- factor(meandiffs_trt$sync_fish, levels = c("med", "high"))
+
+meandiffs_trt$var <- factor(meandiffs_trt$var, levels = c("surv", "biom", "mass", "grow", "emer"))
+run$var <- factor(run$var, levels = c("surv", "biom", "mass", "grow", "emer"))
+run1 <- subset(run, subset = (mean_fish != 50 & mean_fish != 70))
+
+## first, the raw data
+rawdata <- ggplot(data = subset(run, subset = (sp == "f")), aes(x = as.factor(sync_fish), y = mean, 
+                fill = mean_fish, color = mean_fish, group = mean_fish, shape = mean_fish)) + 
+  pres_theme +
+  #geom_smooth(method = "lm", formula = y ~ poly(x, 2)) +
+  geom_point(size = 1.5, alpha = 0.5,
+             position = position_dodge(width = 0.5)) +
+  facet_wrap(~var, ncol = 1, scales = "free_y", labeller = variable_labeller_abs) +
+  labs(y = "absolute measurement", 
+       x = "phenological synchrony", y = NULL) + 
+  scale_color_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_fill_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_shape_manual(values = c(21, 24, 23))  + 
+  theme(legend.position = "none", panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_text(margin = margin(t = 0, r = 30, b = 0, l = 0))) +
+  scale_x_discrete(breaks = c("0", "15", "30"), labels = c("high", "med", "low"))
+rawdata
+## Now, making the mean_diffs df
+mean_diffs <- ggplot(meandiffs_trt, aes(x = as.factor(sync_fish), y = umd, 
+                          color = mean_fish, shape = mean_fish, fill = mean_fish, group = mean_fish)) +
+  pres_theme +
+  geom_smooth(span = 5) +
+  geom_errorbar(aes(ymax = umd + umd_se, ymin = umd - umd_se), width = 0,
+                position = position_dodge(width = 0.5), size = 1) +
+  geom_point(size = 2.5, color = "black",
+             position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_fill_manual(values = c("#01A08A",  "#F4AC00", "#FF2401")) +
+  scale_shape_manual(values = c(21, 24, 23))  + 
+  facet_wrap(~var, ncol = 1, scales = "free_y", labeller = variable_labeller_rel) +
+  theme(legend.position = "none",
+        axis.title.y = element_text(margin = margin(t = 0, r = 30, b = 0, l = 0))) +
+  labs(x = "phenological synchrony",
+       y = "proportional difference from corresponding asymmetry at high synchrony", 
+       color = "relative mean arrival of focal species",
+       shape = "relative mean arrival of focal species",
+       fill = "relative mean arrival of focal species") +
+  scale_x_discrete(breaks = c("0", "15" ,"30"), labels = c("high", "med", "low"))
+mean_diffs
+fig4 <- plot_grid(rawdata, mean_diffs, ncol = 2)
+```
+
